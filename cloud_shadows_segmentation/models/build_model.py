@@ -20,6 +20,7 @@ def build_network(
         "scan",
         "combined_mlp",
         "combined_cnn",
+        "combined_attention"
     )
     assert model_name in implemented_networks
 
@@ -41,4 +42,8 @@ def build_network(
         model = create_combined_model(in_dim, num_classes, fold)
     elif model_name == "combined_cnn":
         model = create_combined_model_cnn(in_dim, num_classes, fold)
+    elif model_name == "combined_attention":
+        # Reutilizamos la variable mlp_dims que viene del archivo .yaml para leer el embed_dim
+        embed_dim = int(mlp_dims) if mlp_dims and mlp_dims.isdigit() else 64
+        model = create_combined_model_cnn(in_dim, num_classes, fold, embed_dim=embed_dim, model_type="combined_attention")
     return model

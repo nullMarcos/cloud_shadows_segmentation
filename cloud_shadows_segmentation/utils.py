@@ -130,19 +130,24 @@ def plot_learning_curves_from_df(base_path):
     val = val.drop(columns=["epoch"])
 
     metrics = train.columns
-    fig, axs = plt.subplots(nrows=len(metrics), ncols=1, figsize=(4, 16))
+    fig, axs = plt.subplots(nrows=len(metrics), ncols=1, figsize=(8, 24))
+    if len(metrics) == 1: 
+        axs = [axs]
+    
     for i, metric in enumerate(metrics):
-        axs[i].set_title(metric)
-        axs[i].plot(epochs, train[metric], c="k", label="train")
-        axs[i].plot(epochs, val[metric], c="b", label="val")
-        axs[i].set_title("Learning curve {}".format(metric), fontsize=25)
-        axs[i].set_xlabel("Epoch", fontsize=20)
-        axs[i].set_ylabel(metric, fontsize=20)
-        axs[i].grid(True)
-        axs[i].legend(loc="best", fontsize=20)
+        axs[i].plot(epochs, train[metric], c="k", label="train", linewidth=2)
+        axs[i].plot(epochs, val[metric], c="b", label="val", linewidth=2)
+
+        axs[i].set_title(f"Learning curve {metric}", fontsize=16, pad=10, fontweight='bold')
+        axs[i].set_xlabel("Epoch", fontsize=12)
+        axs[i].set_ylabel(metric, fontsize=12)
+        
+        axs[i].grid(True, linestyle="--", alpha=0.7)
+        axs[i].legend(loc="best", fontsize=11)
+        axs[i].tick_params(axis='both', labelsize=10)
     fig.tight_layout()
-    fig.subplots_adjust(top=0.8)
-    plt.savefig(f"{base_path}/learning_curves.png")
+    plt.savefig(f"{base_path}/learning_curves.png", bbox_inches='tight', dpi=150)
+    plt.close(fig)
 
 
 def plot_confusion_matrix(

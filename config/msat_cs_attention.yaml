@@ -1,0 +1,15 @@
+model_names: ["combined_attention"]
+weights: [True]
+norm_types: ["std"]
+lrs: [1e-3]
+n_folds: 5
+finetune: False
+n_parallel_training: 1
+fixed_params:
+  data_dir: "/tmp/data/msat_cs2"
+  run_dir: "../experiments/msat_cs_filtered_with_low_signal"
+  batch_size: 4
+  n_workers: 4
+  in_dim: 1080
+  hidden_dims: "64" # Aqui pasar el embed_dim
+  use_amp: False

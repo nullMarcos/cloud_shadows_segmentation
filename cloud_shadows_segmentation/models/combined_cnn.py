@@ -1,9 +1,10 @@
 import os
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
-from typing import List, Tuple
-from models.unet import Unet
 from models.scan import SpectralChannelAttentionNetwork
+from models.unet import Unet
 
 
 class CombinedModelCNN(nn.Module):
@@ -166,7 +167,9 @@ class CombinedModelMultiScaleCNN(nn.Module):
 
         # Downsampling path
         self.down1 = self._make_down_block(base_channels, base_channels * 2, dropout)
-        self.down2 = self._make_down_block(base_channels * 2, base_channels * 4, dropout)
+        self.down2 = self._make_down_block(
+            base_channels * 2, base_channels * 4, dropout
+        )
 
         # Upsampling path with skip connections
         self.up1 = self._make_up_block(base_channels * 4, base_channels * 2, dropout)
@@ -192,7 +195,9 @@ class CombinedModelMultiScaleCNN(nn.Module):
         """Create an upsampling block with skip connections for the multi-scale CNN."""
         return nn.ModuleDict(
             {
-                "upsample": nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2),
+                "upsample": nn.ConvTranspose2d(
+                    in_channels, out_channels, kernel_size=2, stride=2
+                ),
                 "conv": nn.Sequential(
                     nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
                     nn.ReLU(inplace=True),
@@ -281,7 +286,157 @@ class CombinedModelMultiScaleCNN(nn.Module):
         return x, y
 
 
-def create_combined_model_cnn(in_dim: int, num_classes: int, fold: int, model_type: str = "cnn"):
+class CombinedModelCrossAttention(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        unet_model: nn.Module,
+        san_model: nn.Module,
+        embed_dim: int = 64,
+        num_heads: int = 4,
+        dropout: float = 0.2,
+    ):
+        """
+        Combines U-Net and SAN models using a Cross-Attention mechanism.
+        """
+        super().__init__()
+
+        self.unet = unet_model
+        self.san = san_model
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+
+        # Freeze pretrained models
+        for param in self.unet.parameters():
+            param.requires_grad = False
+        for param in self.san.parameters():
+            param.requires_grad = False
+
+        # Proyecciones lineales para llevar las predicciones al tamaño de embedding
+        # U-Net entrega (B, num_classes, H, W)
+        self.proj_unet = nn.Conv2d(num_classes, embed_dim, kernel_size=1)
+        # SAN entrega (B, H, W, num_classes)
+        self.proj_san = nn.Conv2d(num_classes, embed_dim, kernel_size=1)
+
+        # Capa de normalización y salida final
+        self.norm = nn.LayerNorm(embed_dim)
+        self.final_conv = nn.Conv2d(embed_dim, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Forward pass usando Cross-Attention.
+        x: Input tensor de forma (B, H, W, C)
+        """
+        B, H, W, _ = x.shape
+
+        # Obtener predicciones congeladas de los expertos
+        x_unet, _ = self.unet.preprocess(x, None)
+        x_san, _ = self.san.preprocess(x, None)
+
+        with torch.no_grad():
+            unet_pred = self.unet(x_unet)  # (B, num_classes, H, W)
+            san_pred = self.san(x_san)  # (B, H, W, num_classes)
+
+        # SAN sigue la forma Channel-First: (B, num_classes, H, W)
+        san_pred = san_pred.permute(0, 3, 1, 2)
+
+        # Proyectar al espacio de embedding común
+        query_feat = self.proj_unet(unet_pred)  # Querys desde U-Net: (B, 64, H_unet, W_unet)
+        kv_feat = self.proj_san(san_pred)  # Keys y Values desde SAN: (B, 64, H_san, W_san)
+        
+        # PARCHE:
+        # Comparar las dimensiones de ambos expertos
+        # Si difieren, interpolamos SCAN al tamano de U-Net
+        H_target, W_target = query_feat.shape[2], query_feat.shape[3]
+        if kv_feat.shape[2:] != query_feat.shape[2:]:
+            kv_feat = torch.nn.functional.interpolate(
+                kv_feat, 
+                size=(H_target, W_target), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # Actualizamos H y W espaciales para la reconstrucción final del tensor
+        H, W = H_target, W_target
+
+        # Se colapsa el espacio 2D (H, W) en una dimensión lineal (H*W).
+        # Salidas tienen forma: (B, 64, H*W)
+        Q = query_feat.flatten(2)  # Matriz Query (Origen: U-Net)
+        K = kv_feat.flatten(2)  # Matriz Key   (Origen: SAN)
+        V = kv_feat.flatten(2)  # Matriz Value (Origen: SAN)
+
+        # Cálculo manual de cross attention
+        # A. Calcular matriz de afinidad cruzada canal a canal (Q x K^T)
+        # Operación: (B, 64, H*W) x (B, H*W, 64) -> Resultado: (B, 64, 64)
+        attn_scores = torch.bmm(Q, K.transpose(-2, -1))
+        
+        # B. Escalamiento por la raíz del área espacial para estabilizar gradientes
+        attn_scores = attn_scores / torch.sqrt(torch.tensor(H * W, dtype=torch.float32, device=x.device))
+        
+        # C. Softmax para convertir las puntuaciones de afinidad en distribuciones de probabilidad
+        attn_weights = torch.functional.F.softmax(attn_scores, dim=-1) # (B, 64, 64)
+
+        # D. Ponderar los valores de SAN usando los pesos de atención calculados
+        # Operación: (B, 64, 64) x (B, 64, H*W) -> Resultado: (B, 64, H*W)
+        attn_output = torch.bmm(attn_weights, V) 
+
+        # Conexión residual: Sumar los mapas originales de U-Net (Q) para no perder su guía
+        x_attn = attn_output + Q  # (B, 64, H*W)
+        # Permutación temporal porque LayerNorm evalúa la última dimensión del tensor
+        x_attn = x_attn.permute(0, 2, 1)  # (B, H*W, 64)
+        x_attn = self.norm(x_attn)
+        x_attn = x_attn.permute(0, 2, 1)  # Volvemos a (B, 64, H*W)
+
+        # Deshacer el aplanado: Reconstruir la forma de imagen bidimensional (B, 64, H, W)
+        x_spatial = x_attn.reshape(B, self.embed_dim, H, W)
+
+        # Reducir el canal de embedding al número de clases: (B, num_classes, H, W)
+        out = self.final_conv(x_spatial) 
+
+        # PARCHE
+        # Si la imagen procesada perdió píxeles por el camino, la interpolamos al tamaño
+        # exacto de la entrada 'x'. Esto evita colapsos de dimensiones en scikit-learn.
+        H_orig, W_orig = x.shape[1], x.shape[2]
+        if out.shape[2:] != (H_orig, W_orig):
+            out = torch.nn.functional.interpolate(
+                out, 
+                size=(H_orig, W_orig), 
+                mode='bilinear', 
+                align_corners=False
+            )
+
+        # Pasar a Channel-Last (Estándar final esperado por el pipeline): (B, H_orig, W_orig, num_classes)
+        output = out.permute(0, 2, 3, 1)  # (B, H, W, num_classes)
+
+        return output
+
+    def get_loss(self, x, y, class_weights=None, return_logits=False, reduction="mean"):
+        logits = self.forward(x)
+        B, H, W, C = logits.shape
+        logits_flat = logits.reshape(-1, C)
+        y_flat = y.reshape(-1)
+        loss = nn.functional.cross_entropy(
+            logits_flat, y_flat, weight=class_weights, reduction=reduction
+        )
+        if return_logits:
+            return loss, logits
+        return loss
+
+    def predict(self, x):
+        return torch.argmax(self(x), dim=-1)
+
+    def preprocess(self, x, y):
+        return x, y
+
+
+def create_combined_model_cnn(
+    in_dim: int,
+    num_classes: int,
+    fold: int,
+    embed_dim: int = 64,
+    model_type: str = "cnn",
+):
     """
     Creates and initializes the combined model with CNN merger and pretrained weights.
 
@@ -292,8 +447,8 @@ def create_combined_model_cnn(in_dim: int, num_classes: int, fold: int, model_ty
         model_type: Type of merger to use, either "cnn" for simple CNN or
                    "multiscale" for multi-scale CNN with skip connections
     """
-    unet_path = f"../experiments/msat_cs_filtered_with_low_signal/unetv1_lr5e-3_none_wTrue_f{fold}/checkpoint_best.pth"
-    san_path = f"../experiments/msat_cs_filtered_with_low_signal/improvedhlr_lr1e-3_none_wTrue_f{fold}/checkpoint_best.pth"
+    unet_path = f"./unetv1_lr5e-3_none_wTrue_f{fold}/checkpoint_best.pth"
+    san_path = f"./scan_lr1e-3_none_wTrue_f{fold}/checkpoint_best.pth"
     # unet_path = f"../experiments/exp_full/unetv1_lr1e-3_std_full_wTrue_f{fold}/checkpoint_best.pth"
     # san_path = f"../experiments/exp_full/improvedhlr_lr1e-2_std_full_wTrue_f{fold}/checkpoint_best.pth"
     # Initialize individual models
@@ -316,6 +471,15 @@ def create_combined_model_cnn(in_dim: int, num_classes: int, fold: int, model_ty
     elif model_type == "multiscale":
         combined_model = CombinedModelMultiScaleCNN(
             in_dim=in_dim, num_classes=num_classes, unet_model=unet, san_model=san
+        )
+    elif model_type == "combined_attention":
+        combined_model = CombinedModelCrossAttention(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            unet_model=unet,
+            san_model=san,
+            embed_dim=embed_dim,  # experimentar subiéndolo a 128
+            num_heads=4,
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")

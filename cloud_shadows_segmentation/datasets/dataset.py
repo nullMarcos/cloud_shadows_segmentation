@@ -1,18 +1,18 @@
-import joblib
-import numpy as np
-import netCDF4 as nc
-import torch
-from typing import List, Tuple, Dict, Optional
-from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Optional, Tuple
 
+import joblib
+import netCDF4 as nc
+import numpy as np
+import torch
 from datasets.dataset_utils import (
     center_crop,
+    compute_percentiles,
     random_crop,
     random_horizontal_flip,
-    random_vertical_flip,
     random_rotation,
-    compute_percentiles,
+    random_vertical_flip,
 )
+from torch.utils.data import DataLoader, Dataset
 
 
 class HyperspectralDataset(Dataset):
@@ -78,14 +78,16 @@ class HyperspectralDataset(Dataset):
             data = np.load(f"{self.base_path}/images/{data_path}")
             mask = nc.Dataset(f"{self.base_path}/masks/{mask_path}")
 
-            mask_full = torch.zeros((end_x - start_x, end_y - start_y), dtype=torch.long)
+            mask_full = torch.zeros(
+                (end_x - start_x, end_y - start_y), dtype=torch.long
+            )
             for key, value in self.class_map.items():
                 mask_tmp = torch.from_numpy(
                     mask[key][start_x:end_x, start_y:end_y].astype(np.int64)
                 )
                 mask_full = torch.where(mask_tmp == 1, value, mask_full)
 
-        elif self.dataset_type == "msat_cs":
+        elif self.dataset_type == "msat_cs2":
             (start_y, end_y) = (16, 2032)
 
             data_path = mask_path
@@ -95,7 +97,9 @@ class HyperspectralDataset(Dataset):
                 .replace("v04001001", "v03002000")
                 .replace(".npy", "_ns.npy")
             )
-            mask_full = np.load(f"{self.base_path}/masks/{mask_file}")[1:, start_y:end_y]
+            mask_full = np.load(f"{self.base_path}/masks/{mask_file}")[
+                1:, start_y:end_y
+            ]
 
             mask_full = np.nan_to_num(mask_full, nan=0.0)
             mask_full[mask_full == 3.0] = 1.0
@@ -126,7 +130,9 @@ class HyperspectralDataset(Dataset):
             np.ndarray: Normalized data.
         """
         if self.norm_type in ["minmax", "minmax_full"]:
-            return (data - self.scaler.data_min_) / (self.scaler.data_max_ - self.scaler.data_min_)
+            return (data - self.scaler.data_min_) / (
+                self.scaler.data_max_ - self.scaler.data_min_
+            )
         elif self.norm_type in ["std", "std_full"]:
             return (data - self.scaler.mean_) / (self.scaler.var_**0.5)
         elif self.norm_type == "p_norm":
@@ -161,7 +167,8 @@ def get_dataloader(
         Tuple[DataLoader, DataLoader, Dict[str, int]]: Train dataloader, validation dataloader, and full class map.
     """
     assert any(
-        x in ["plumes", "cloud_shadow_mask", "cloud_mask", "dark_surface_mask"] for x in mask_types
+        x in ["plumes", "cloud_shadow_mask", "cloud_mask", "dark_surface_mask"]
+        for x in mask_types
     )
 
     obj_list = np.load(base_path + "/mask_list.npy")
@@ -178,6 +185,11 @@ def get_dataloader(
     mask[fold_ids] = False  # setting validation indexes as False
     val_list, train_list = obj_list[mask], obj_list[~mask]
 
+    # Tomar aprox. 100 GB del dataset (pesa 591G).
+    train_list = train_list[: len(train_list) // 5]
+    val_list = val_list[: len(val_list) // 5]
+    test_list = test_list[: len(test_list) // 5]
+
     class_map = {
         type_: i + 1 for i, type_ in enumerate(mask_types)
     }  # label 0 reserved for normal objects
@@ -185,13 +197,25 @@ def get_dataloader(
     dataset_type = base_path.split("/")[-1]
 
     train_dataset = HyperspectralDataset(
-        base_path, train_list, norm_type, class_map, scaler, dataset_type, apply_transforms=False
+        base_path,
+        train_list,
+        norm_type,
+        class_map,
+        scaler,
+        dataset_type,
+        apply_transforms=False,
     )
     train_loader = DataLoader(
         train_dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers
     )
     val_dataset = HyperspectralDataset(
-        base_path, val_list, norm_type, class_map, scaler, dataset_type, apply_transforms=False
+        base_path,
+        val_list,
+        norm_type,
+        class_map,
+        scaler,
+        dataset_type,
+        apply_transforms=False,
     )
     val_loader = DataLoader(
         val_dataset, shuffle=False, batch_size=batch_size, num_workers=num_workers
@@ -206,6 +230,8 @@ def get_dataloader(
         apply_transforms=False,
         test=True,
     )
-    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=1, num_workers=num_workers)
+    test_loader = DataLoader(
+        test_dataset, shuffle=False, batch_size=1, num_workers=num_workers
+    )
     full_class_map = {**class_map, "background": 0}
     return train_loader, val_loader, test_loader, full_class_map
