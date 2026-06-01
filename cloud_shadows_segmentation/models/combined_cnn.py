@@ -412,10 +412,17 @@ class CombinedModelCrossAttention(nn.Module):
         return output
 
     def get_loss(self, x, y, class_weights=None, return_logits=False, reduction="mean"):
-        logits = self.forward(x)
+        """
+        Calcula la función de pérdida Entropía Cruzada sobre los píxeles aplanados.
+        """
+        logits = self.forward(x) # Obtener predicciones (B, H, W, num_classes)
         B, H, W, C = logits.shape
-        logits_flat = logits.reshape(-1, C)
-        y_flat = y.reshape(-1)
+
+        # Aplanar para cumplir con el formato requerido por CrossEntropyLoss en PyTorch
+        logits_flat = logits.reshape(-1, C) # (B * H * W, num_classes)
+        y_flat = y.reshape(-1)              # (B * H * W)
+        
+        # Calcular pérdida aplicando los pesos de penalización por desbalance (class_weights)
         loss = nn.functional.cross_entropy(
             logits_flat, y_flat, weight=class_weights, reduction=reduction
         )
