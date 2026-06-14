@@ -306,6 +306,7 @@ class CombinedModelCrossAttention(nn.Module):
         self.san = san_model
         self.num_classes = num_classes
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
 
         # Freeze pretrained models
         for param in self.unet.parameters():
@@ -318,6 +319,8 @@ class CombinedModelCrossAttention(nn.Module):
         self.proj_unet = nn.Conv2d(num_classes, embed_dim, kernel_size=1)
         # SAN entrega (B, H, W, num_classes)
         self.proj_san = nn.Conv2d(num_classes, embed_dim, kernel_size=1)
+
+        self.dropout = nn.Dropout(dropout)
 
         # Capa de normalización y salida final
         self.norm = nn.LayerNorm(embed_dim)
@@ -361,28 +364,43 @@ class CombinedModelCrossAttention(nn.Module):
         H, W = H_target, W_target
 
         # Se colapsa el espacio 2D (H, W) en una dimensión lineal (H*W).
-        # Salidas tienen forma: (B, 64, H*W)
-        Q = query_feat.flatten(2)  # Matriz Query (Origen: U-Net)
-        K = kv_feat.flatten(2)  # Matriz Key   (Origen: SAN)
-        V = kv_feat.flatten(2)  # Matriz Value (Origen: SAN)
+        Q_orig = query_feat.flatten(2)  # Matriz Query (Origen: U-Net)
+        K_orig = kv_feat.flatten(2)  # Matriz Key   (Origen: SAN)
+        V_orig = kv_feat.flatten(2)  # Matriz Value (Origen: SAN)
 
-        # Cálculo manual de cross attention
-        # A. Calcular matriz de afinidad cruzada canal a canal (Q x K^T)
-        # Operación: (B, 64, H*W) x (B, H*W, 64) -> Resultado: (B, 64, 64)
-        attn_scores = torch.bmm(Q, K.transpose(-2, -1))
+        B_size, C, N = Q_orig.shape
+        head_dim = C // self.num_heads
+
+        # Reshape para multi-head attention: (B, num_heads, head_dim, N)
+        Q = Q_orig.view(B_size, self.num_heads, head_dim, N)
+        K = K_orig.view(B_size, self.num_heads, head_dim, N)
+        V = V_orig.view(B_size, self.num_heads, head_dim, N)
+
+        # Cálculo de cross attention estabilizado (Channel Attention)
+        # L2-normalize Q y K sobre la dimensión espacial para evitar explosión de dot product (NaNs)
+        Q_norm = torch.nn.functional.normalize(Q, p=2, dim=-1)
+        K_norm = torch.nn.functional.normalize(K, p=2, dim=-1)
+
+        # A. Calcular matriz de afinidad cruzada canal a canal por cada head
+        # (B, num_heads, head_dim, N) x (B, num_heads, N, head_dim) -> (B, num_heads, head_dim, head_dim)
+        attn_scores = torch.matmul(Q_norm, K_norm.transpose(-2, -1))
         
-        # B. Escalamiento por la raíz del área espacial para estabilizar gradientes
-        attn_scores = attn_scores / torch.sqrt(torch.tensor(H * W, dtype=torch.float32, device=x.device))
+        # B. Escalamiento por la raíz de head_dim (temperatura) para estabilizar el softmax
+        attn_scores = attn_scores * (head_dim ** 0.5)
         
         # C. Softmax para convertir las puntuaciones de afinidad en distribuciones de probabilidad
-        attn_weights = torch.functional.F.softmax(attn_scores, dim=-1) # (B, 64, 64)
+        attn_weights = torch.functional.F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
 
         # D. Ponderar los valores de SAN usando los pesos de atención calculados
-        # Operación: (B, 64, 64) x (B, 64, H*W) -> Resultado: (B, 64, H*W)
-        attn_output = torch.bmm(attn_weights, V) 
+        # (B, num_heads, head_dim, head_dim) x (B, num_heads, head_dim, N) -> (B, num_heads, head_dim, N)
+        attn_output = torch.matmul(attn_weights, V) 
+        
+        # Reconstruir la forma original (B, C, N)
+        attn_output = attn_output.view(B_size, C, N)
 
-        # Conexión residual: Sumar los mapas originales de U-Net (Q) para no perder su guía
-        x_attn = attn_output + Q  # (B, 64, H*W)
+        # Conexión residual: Sumar los mapas originales de U-Net (Q_orig) para no perder su guía
+        x_attn = attn_output + Q_orig  # (B, 64, H*W)
         # Permutación temporal porque LayerNorm evalúa la última dimensión del tensor
         x_attn = x_attn.permute(0, 2, 1)  # (B, H*W, 64)
         x_attn = self.norm(x_attn)
