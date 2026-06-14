@@ -247,7 +247,7 @@ def prediction_model_with_patches(
                     # Get model prediction
                     patch_pred = model(patch)
 
-                    if model_name != "unetv1":
+                    if model_name not in ["unet", "unetv1", "unet_attention"]:
                         patch_pred = patch_pred.permute(0, 3, 1, 2)
 
                     prediction_map[:, y : y + patch_size, x : x + patch_size] += patch_pred.squeeze(
@@ -437,6 +437,8 @@ def train_cli(**kwargs):
         or kwargs["model_name"] == "combined_mlp"
         or kwargs["model_name"] == "combined_cnn"
         or kwargs["model_name"] == "combined_attention"
+        or kwargs["model_name"] == "combined_multiscale"
+        or kwargs["model_name"] == "unet_attention"
     ):
         preds, labels = prediction_model_with_patches(
             kwargs["model_name"],
