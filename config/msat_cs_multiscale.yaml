@@ -1,0 +1,15 @@
+model_names: ["combined_multiscale"]
+weights: [True]
+norm_types: ["none"]
+lrs: [5e-4]
+n_folds: 3
+finetune: False
+n_parallel_training: 0
+fixed_params:
+  data_dir: "/tmp/data/msat_cs2"
+  run_dir: "/tmp/experiments/msat_cs"
+  batch_size: 16
+  n_workers: 0
+  in_dim: 1080
+  hidden_dims: "20,20"
+  use_amp: True
