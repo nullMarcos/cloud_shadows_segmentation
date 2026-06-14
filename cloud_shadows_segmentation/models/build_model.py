@@ -3,6 +3,7 @@ from models.scan import SpectralChannelAttentionNetwork
 from models.combined_mlp import create_combined_model
 from models.combined_cnn import create_combined_model_cnn
 from models.unet import Unet
+from models.unet_attention import UnetAttention
 
 
 def build_network(
@@ -20,7 +21,8 @@ def build_network(
         "scan",
         "combined_mlp",
         "combined_cnn",
-        "combined_attention"
+        "combined_attention",
+        "unet_attention"
     )
     assert model_name in implemented_networks
 
@@ -38,6 +40,8 @@ def build_network(
         )
     elif model_name == "unet":
         model = Unet(in_dim, num_classes)
+    elif model_name == "unet_attention":
+        model = UnetAttention(in_dim, num_classes)
     elif model_name == "combined_mlp":
         model = create_combined_model(in_dim, num_classes, fold)
     elif model_name == "combined_cnn":
