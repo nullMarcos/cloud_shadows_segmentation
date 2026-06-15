@@ -122,7 +122,6 @@ class CombinedModelCNN(nn.Module):
         """Preprocess the data - returns data in (B, H, W, C) format."""
         return x, y
 
-
 class CombinedModelMultiScaleCNN(nn.Module):
     def __init__(
         self,
@@ -130,141 +129,110 @@ class CombinedModelMultiScaleCNN(nn.Module):
         num_classes: int,
         unet_model: nn.Module,
         san_model: nn.Module,
+        unet_feat_channels: int,   # channels of U-Net's pre-final_conv feature map
+        san_feat_dim: int,         # dim of SAN's pre-final-linear feature (mlp_dims[-1])
         base_channels: int = 64,
+        se_reduction: int = 8,
         dropout: float = 0.2,
     ):
         """
-        Combines U-Net and SAN models using a multi-scale CNN with skip connections
-        to merge their predictions.
-
-        Args:
-            in_dim: Number of input channels/dimensions
-            num_classes: Number of output classes
-            unet_model: Pretrained U-Net model
-            san_model: Pretrained SAN model
-            base_channels: Base number of channels for the CNN
-            dropout: Dropout rate for the CNN
+        Combines U-Net and SAN predictions (plus their intermediate features)
+        using an efficient single-scale fusion CNN with SE-block channel gating.
         """
         super().__init__()
 
-        # Load pretrained models
         self.unet = unet_model
         self.san = san_model
         self.num_classes = num_classes
 
-        # Freeze the pretrained models
         for param in self.unet.parameters():
             param.requires_grad = False
         for param in self.san.parameters():
             param.requires_grad = False
 
-        # Initial convolution to process concatenated features
-        self.init_conv = nn.Sequential(
-            nn.Conv2d(num_classes * 2, base_channels, kernel_size=3, padding=1),
+        # Storage for captured intermediate activations
+        self._unet_feat = None
+        self._san_feat = None
+
+        # Hook U-Net's final_conv input (pre-final spatial features)
+        self.unet.final_conv.register_forward_hook(self._make_hook("unet"))
+        # Hook SAN's final linear layer input (pre-final per-pixel features)
+        self.san.linear[-1].register_forward_hook(self._make_hook("san"))
+
+        # Project intermediate features down to a manageable channel count
+        self.unet_feat_proj = nn.Conv2d(unet_feat_channels, base_channels, kernel_size=1)
+        self.san_feat_proj = nn.Linear(san_feat_dim, base_channels)
+
+        # Input channels: final logits from both models + projected intermediate features from both
+        in_channels = num_classes * 2 + base_channels * 2
+
+        # Single-scale fusion: full-resolution convs, no down/up sampling
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(base_channels),
+            nn.Dropout2d(dropout),
+            SEBlock(base_channels, reduction=se_reduction),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(base_channels),
+            SEBlock(base_channels, reduction=se_reduction),
         )
 
-        # Downsampling path
-        self.down1 = self._make_down_block(base_channels, base_channels * 2, dropout)
-        self.down2 = self._make_down_block(
-            base_channels * 2, base_channels * 4, dropout
-        )
-
-        # Upsampling path with skip connections
-        self.up1 = self._make_up_block(base_channels * 4, base_channels * 2, dropout)
-        self.up2 = self._make_up_block(base_channels * 2, base_channels, dropout)
-
-        # Final convolution to produce class predictions
         self.final_conv = nn.Conv2d(base_channels, num_classes, kernel_size=1)
 
-    def _make_down_block(self, in_channels, out_channels, dropout):
-        """Create a downsampling block for the multi-scale CNN."""
-        return nn.Sequential(
-            nn.MaxPool2d(2),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(out_channels),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(out_channels),
-        )
-
-    def _make_up_block(self, in_channels, out_channels, dropout):
-        """Create an upsampling block with skip connections for the multi-scale CNN."""
-        return nn.ModuleDict(
-            {
-                "upsample": nn.ConvTranspose2d(
-                    in_channels, out_channels, kernel_size=2, stride=2
-                ),
-                "conv": nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.BatchNorm2d(out_channels),
-                    nn.Dropout2d(dropout),
-                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.BatchNorm2d(out_channels),
-                ),
-            }
-        )
+    def _make_hook(self, name):
+        def hook(module, input, output):
+            if name == "unet":
+                self._unet_feat = input[0]  # (B, unet_feat_channels, H, W)
+            else:
+                self._san_feat = input[0]   # (B*H*W, san_feat_dim)
+        return hook
 
     def forward(self, x):
         """
-        Forward pass of the combined model with multi-scale CNN merger.
-
         Args:
             x: Input tensor of shape (B, H, W, C)
-
         Returns:
             output: Output tensor of shape (B, H, W, num_classes)
         """
-        # Preprocess data for each model
+        B, H, W, _ = x.shape
+
         x_unet, _ = self.unet.preprocess(x, None)
         x_san, _ = self.san.preprocess(x, None)
 
-        # Get predictions from both models
         with torch.no_grad():
-            unet_pred = self.unet(x_unet)  # Shape: (B, C, H, W)
-            san_pred = self.san(x_san)  # Shape: (B, H, W, C)
+            unet_pred = self.unet(x_unet)  # (B, num_classes, H, W)
+            san_pred = self.san(x_san)     # (B, H, W, num_classes)
 
-        # Convert SAN predictions to channel-first format
-        san_pred = san_pred.permute(0, 3, 1, 2)  # Convert to (B, C, H, W)
+        san_pred = san_pred.permute(0, 3, 1, 2)  # (B, num_classes, H, W)
 
-        # Concatenate along the channel dimension
-        combined = torch.cat([unet_pred, san_pred], dim=1)  # Shape: (B, 2*C, H, W)
+        assert unet_pred.shape[2:] == san_pred.shape[2:], (
+            f"U-Net and SAN spatial sizes differ: {unet_pred.shape[2:]} vs {san_pred.shape[2:]}"
+        )
 
-        # Apply multi-scale CNN with skip connections
-        x1 = self.init_conv(combined)
+        # --- Retrieve and reshape captured intermediate features ---
+        unet_feat = self._unet_feat.detach()  # (B, unet_feat_channels, H, W)
 
-        # Downsampling path
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
+        san_feat = self._san_feat.detach()    # (B*H*W, san_feat_dim)
+        san_feat = san_feat.reshape(B, H, W, -1).permute(0, 3, 1, 2)  # (B, san_feat_dim, H, W)
 
-        # Upsampling path with skip connections
-        x = self.up1["upsample"](x3)
-        x = torch.cat([x, x2], dim=1)
-        x = self.up1["conv"](x)
+        # Project both to base_channels
+        unet_feat_proj = self.unet_feat_proj(unet_feat)
+        san_feat_proj = self.san_feat_proj(san_feat.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        x = self.up2["upsample"](x)
-        x = torch.cat([x, x1], dim=1)
-        x = self.up2["conv"](x)
+        # Concatenate: final logits from both + projected intermediate features
+        combined = torch.cat([unet_pred, san_pred, unet_feat_proj, san_feat_proj], dim=1)
 
-        # Final convolution
+        # Single-scale fusion with SE-gated channel recalibration
+        x = self.fusion(combined)
         x = self.final_conv(x)
 
-        # Convert back to the expected output format (B, H, W, C)
-        output = x.permute(0, 2, 3, 1)
-
+        output = x.permute(0, 2, 3, 1)  # (B, H, W, num_classes)
         return output
 
     def get_loss(self, x, y, class_weights=None, return_logits=False, reduction="mean"):
-        """
-        Calculate loss for the combined model.
-        """
         logits = self.forward(x)
-        # Reshape logits and y for loss calculation
         B, H, W, C = logits.shape
         logits_flat = logits.reshape(-1, C)
         y_flat = y.reshape(-1)
@@ -278,13 +246,27 @@ class CombinedModelMultiScaleCNN(nn.Module):
         return loss
 
     def predict(self, x):
-        """Get the mask prediction."""
         return torch.argmax(self(x), dim=-1)
 
     def preprocess(self, x, y):
-        """Preprocess the data - returns data in (B, H, W, C) format."""
         return x, y
 
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for channel-wise recalibration."""
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        reduced = max(1, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, reduced, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return x * self.fc(x)
 
 class CombinedModelCrossAttention(nn.Module):
     def __init__(
