@@ -129,10 +129,10 @@ class CombinedModelMultiScaleCNN(nn.Module):
         num_classes: int,
         unet_model: nn.Module,
         san_model: nn.Module,
-        unet_feat_channels: int,   # channels of U-Net's pre-final_conv feature map
-        san_feat_dim: int,         # dim of SAN's pre-final-linear feature (mlp_dims[-1])
+        unet_feat_channels: int = 16,   # (nuevo) channels of U-Net's pre-final_conv feature map
+        san_feat_dim: int = 20,         # (nuevo) dim of SAN's pre-final-linear feature (mlp_dims[-1])
         base_channels: int = 64,
-        se_reduction: int = 8,
+        se_reduction: int = 8,     # (nuevo)
         dropout: float = 0.2,
     ):
         """
@@ -154,8 +154,13 @@ class CombinedModelMultiScaleCNN(nn.Module):
         self._unet_feat = None
         self._san_feat = None
 
-        # Hook U-Net's final_conv input (pre-final spatial features)
-        self.unet.final_conv.register_forward_hook(self._make_hook("unet"))
+        # Hook U-Net's final_conv or upconv1 input (pre-final spatial features)
+        if hasattr(self.unet, "final_conv"):
+            self.unet.final_conv.register_forward_hook(self._make_hook("unet"))
+        elif hasattr(self.unet, "upconv1"):
+            self.unet.upconv1.register_forward_hook(self._make_hook("unet"))
+        else:
+            raise AttributeError("U-Net model has neither final_conv nor upconv1 attribute to hook.")
         # Hook SAN's final linear layer input (pre-final per-pixel features)
         self.san.linear[-1].register_forward_hook(self._make_hook("san"))
 
@@ -212,7 +217,15 @@ class CombinedModelMultiScaleCNN(nn.Module):
         )
 
         # --- Retrieve and reshape captured intermediate features ---
-        unet_feat = self._unet_feat.detach()  # (B, unet_feat_channels, H, W)
+        unet_feat = self._unet_feat.detach()  # (B, unet_feat_channels, H_feat, W_feat)
+        # Interpolate U-Net features to target spatial size (H, W) if they differ
+        if unet_feat.shape[2:] != (H, W):
+            unet_feat = torch.nn.functional.interpolate(
+                unet_feat,
+                size=(H, W),
+                mode='bilinear',
+                align_corners=False
+            )
 
         san_feat = self._san_feat.detach()    # (B*H*W, san_feat_dim)
         san_feat = san_feat.reshape(B, H, W, -1).permute(0, 3, 1, 2)  # (B, san_feat_dim, H, W)
