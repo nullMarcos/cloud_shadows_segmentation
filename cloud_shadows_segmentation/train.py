@@ -438,6 +438,7 @@ def train_cli(**kwargs):
         or kwargs["model_name"] == "combined_cnn"
         or kwargs["model_name"] == "combined_attention"
         or kwargs["model_name"] == "combined_multiscale"
+        or kwargs["model_name"] == "combined_multiscale_v2"
         or kwargs["model_name"] == "unet_attention"
     ):
         preds, labels = prediction_model_with_patches(

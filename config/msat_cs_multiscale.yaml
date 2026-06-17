@@ -1,4 +1,4 @@
-model_names: ["combined_multiscale"]
+model_names: ["combined_multiscale_v2"]
 weights: [True]
 norm_types: ["none"]
 lrs: [5e-4]

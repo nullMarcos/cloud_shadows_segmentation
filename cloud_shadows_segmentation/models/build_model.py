@@ -23,7 +23,8 @@ def build_network(
         "combined_cnn",
         "combined_attention",
         "unet_attention",
-        "combined_multiscale"
+        "combined_multiscale",
+        "combined_multiscale_v2"
     )
     assert model_name in implemented_networks
 
@@ -47,7 +48,7 @@ def build_network(
         model = create_combined_model(in_dim, num_classes, fold)
     elif model_name == "combined_cnn":
         model = create_combined_model_cnn(in_dim, num_classes, fold)
-    elif model_name == "combined_multiscale":
+    elif model_name == "combined_multiscale" or model_name == "combined_multiscale_v2":
         model = create_combined_model_cnn(in_dim, num_classes, fold, model_type="multiscale")
     elif model_name == "combined_attention":
         # Reutilizamos la variable mlp_dims que viene del archivo .yaml para leer el embed_dim
