@@ -186,11 +186,10 @@ def get_dataloader(
     val_list, train_list = obj_list[mask], obj_list[~mask]
 
     # Tomar aprox. 100 GB del dataset (pesa 591G).
-    '''
     train_list = train_list[: len(train_list) // 5]
     val_list = val_list[: len(val_list) // 5]
     test_list = test_list[: len(test_list) // 5]
-    '''
+
     class_map = {
         type_: i + 1 for i, type_ in enumerate(mask_types)
     }  # label 0 reserved for normal objects
