@@ -7,9 +7,9 @@ finetune: False
 n_parallel_training: 0
 fixed_params:
   data_dir: "/tmp/data/msat_cs2"
-  run_dir: "../experiments/msat_cs_filtered_with_low_signal"
+  run_dir: "../tmp/experiments/unet_attention_v1"
   batch_size: 16
-  n_workers: 0
+  n_workers: 4
   in_dim: 1080
   hidden_dims: "20,20"
   use_amp: True
