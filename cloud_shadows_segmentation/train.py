@@ -30,6 +30,10 @@ import warnings
 import logging
 from torch.cuda.amp import autocast, GradScaler
 
+# Optimizations for Ampere (A100/A6000)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 warnings.filterwarnings("ignore")
 
 # Existing logging configuration
@@ -356,7 +360,16 @@ def train_cli(**kwargs):
 
     model = build_network(
         kwargs["model_name"], kwargs["in_dim"], num_classes, kwargs["fold"], kwargs["hidden_dims"]
-    ).to(device)
+    )
+    
+    # Try compiling for A100/A6000 speedup
+    try:
+        model = torch.compile(model)
+        logger.info("Model successfully wrapped with torch.compile!")
+    except Exception as e:
+        logger.warning(f"Could not compile model, proceeding with eager mode. Error: {e}")
+        
+    model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=kwargs["lr"], weight_decay=kwargs["lambda_l2"]
     )
@@ -372,11 +385,15 @@ def train_cli(**kwargs):
         print("Training parameters restored from source. Fine-tuning!")
 
     if kwargs["pretrained"]:
-        state_dict = torch.load(directory / "checkpoint_best.pth", map_location=device)
+        checkpoint_path = directory / "checkpoint_latest.pth"
+        if not checkpoint_path.exists():
+            checkpoint_path = directory / "checkpoint_best.pth"
+            
+        state_dict = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(state_dict["model"])
         optimizer.load_state_dict(state_dict["optimizer"])
         init_epoch = state_dict["epoch"] + 1
-        logger.info(f"Training parameters restored at epoch {init_epoch}")
+        logger.info(f"Training parameters restored at epoch {init_epoch} from {checkpoint_path.name}")
     else:
         init_epoch = 0
 
@@ -410,6 +427,15 @@ def train_cli(**kwargs):
             save_checkpoint(model, optimizer, epoch, val_metrics, directory)
             save_metrics(directory, train_metrics, "train")
             save_metrics(directory, val_metrics, "val")
+            
+        # Continuous Checkpointing
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "metrics": val_metrics,
+        }, Path(directory) / "checkpoint_latest.pth")
+
         if stop:
             logger.info("Early stopping criterion met. Stopping training.")
             break

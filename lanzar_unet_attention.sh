@@ -15,6 +15,15 @@ python run_experiment.py --config config/msat_cs_unet_attention.yaml 2>&1 | tee 
       FOLD=$(echo "$line" | grep -o "\-\-fold=[0-9]*" | cut -d'=' -f2)
       curl -s -H "Content-Type: application/json" -X POST -d "{\"content\": \"🔄 **Progreso:** Iniciando entrenamiento del Fold $FOLD...\"}" "$URL" > /dev/null
   fi
+
+  # Alerta cada 20 épocas
+  if [[ "$line" == *"Epoch: "* ]]; then
+      # Extraer la época actual del log (ej: "Epoch: 20/100")
+      EPOCH=$(echo "$line" | grep -o "Epoch: [0-9]*" | cut -d' ' -f2)
+      if [ -n "$EPOCH" ] && [ $((EPOCH % 20)) -eq 0 ] && [ "$EPOCH" -ne 0 ]; then
+          curl -s -H "Content-Type: application/json" -X POST -d "{\"content\": \"⏳ **Progreso:** Fold actual alcanzó la Época $EPOCH...\"}" "$URL" > /dev/null
+      fi
+  fi
 done
 
 # Capturar el exit code original de Python

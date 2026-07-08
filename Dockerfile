@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:22.12-py3
+FROM nvcr.io/nvidia/pytorch:24.03-py3
 # ==== PIP SETUP ====
 RUN python -m pip install --upgrade pip
 # INSTALLING IMPORTANT DEPENDENCIES
