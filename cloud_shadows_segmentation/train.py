@@ -363,11 +363,11 @@ def train_cli(**kwargs):
     )
     
     # Try compiling for A100/A6000 speedup
-    try:
-        model = torch.compile(model)
-        logger.info("Model successfully wrapped with torch.compile!")
-    except Exception as e:
-        logger.warning(f"Could not compile model, proceeding with eager mode. Error: {e}")
+    # try:
+    #     model = torch.compile(model)
+    #     logger.info("Model successfully wrapped with torch.compile!")
+    # except Exception as e:
+    #     logger.warning(f"Could not compile model, proceeding with eager mode. Error: {e}")
         
     model = model.to(device)
     optimizer = torch.optim.AdamW(
